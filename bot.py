@@ -1,12 +1,13 @@
 import os
 import json
-import sqlite3
 import asyncio
 import time
 import re
 from datetime import datetime
 from collections import Counter
 
+import gspread
+from google.oauth2.service_account import Credentials
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
@@ -16,95 +17,179 @@ from google import genai
 from google.genai import types
 
 # ── Config ────────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-GEMINI_KEY     = os.environ["GEMINI_API_KEY"]
-DB_PATH        = "jobs.db"
+TELEGRAM_TOKEN  = os.environ["TELEGRAM_BOT_TOKEN"]
+GEMINI_KEY      = os.environ["GEMINI_API_KEY"]
+SHEET_ID        = os.environ["GOOGLE_SHEET_ID"]        # the spreadsheet ID from the URL
+GSERVICE_JSON   = os.environ["GOOGLE_SERVICE_JSON"]    # full service account JSON as a string
 
-client = genai.Client(api_key=GEMINI_KEY)
-MODEL  = "gemini-2.5-flash"
+gemini_client = genai.Client(api_key=GEMINI_KEY)
+MODEL = "gemini-2.5-flash"
+
+# ── Google Sheets client ──────────────────────────────────────────────────────
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+def _sheets_client() -> gspread.Client:
+    info = json.loads(GSERVICE_JSON)
+    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    return gspread.authorize(creds)
+
+def _get_sheet() -> gspread.Worksheet:
+    gc = _sheets_client()
+    sh = gc.open_by_key(SHEET_ID)
+    try:
+        ws = sh.worksheet("Jobs")
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title="Jobs", rows=1000, cols=12)
+        # Write header row
+        ws.append_row([
+            "ID", "Company", "Role", "Location", "Salary",
+            "Skills", "Apply Link", "Strong", "Missing",
+            "Verdict", "Summary", "Date Added"
+        ], value_input_option="RAW")
+    return ws
+
+def _get_resume_sheet() -> gspread.Worksheet:
+    gc = _sheets_client()
+    sh = gc.open_by_key(SHEET_ID)
+    try:
+        ws = sh.worksheet("Resume")
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title="Resume", rows=10, cols=2)
+        ws.append_row(["Key", "Value"])
+    return ws
+
+# Column indices (1-based for gspread)
+COL = {
+    "id":         1,
+    "company":    2,
+    "role":       3,
+    "location":   4,
+    "salary":     5,
+    "skills":     6,
+    "apply_link": 7,
+    "strong":     8,
+    "missing":    9,
+    "verdict":    10,
+    "summary":    11,
+    "date":       12,
+}
+
+# ── Sheet DB operations (all blocking — called via asyncio.to_thread) ─────────
+def _next_id_sync() -> int:
+    ws = _get_sheet()
+    rows = ws.get_all_values()
+    if len(rows) <= 1:   # only header
+        return 1
+    # Find max existing ID
+    ids = []
+    for row in rows[1:]:
+        try: ids.append(int(row[0]))
+        except (ValueError, IndexError): pass
+    return max(ids) + 1 if ids else 1
+
+def _save_job_sync(company, role, location, salary, skills,
+                   apply_link, strong, missing, verdict, summary) -> int:
+    ws = _get_sheet()
+    jid = _next_id_sync()
+    ws.append_row([
+        jid,
+        company,
+        role,
+        location,
+        salary,
+        ", ".join(skills),
+        apply_link,
+        ", ".join(strong),
+        ", ".join(missing),
+        verdict,
+        summary,
+        datetime.utcnow().strftime("%Y-%m-%d"),
+    ], value_input_option="RAW")
+    return jid
+
+def _all_jobs_sync() -> list[dict]:
+    ws = _get_sheet()
+    rows = ws.get_all_records()  # returns list of dicts using header row as keys
+    return rows
+
+def _job_by_id_sync(jid: int) -> dict | None:
+    ws = _get_sheet()
+    rows = ws.get_all_records()
+    for row in rows:
+        if int(row.get("ID", -1)) == jid:
+            return row
+    return None
+
+def _delete_job_sync(jid: int):
+    ws = _get_sheet()
+    rows = ws.get_all_values()  # includes header
+    for i, row in enumerate(rows):
+        if i == 0: continue  # skip header
+        try:
+            if int(row[0]) == jid:
+                ws.delete_rows(i + 1)  # gspread rows are 1-indexed
+                return True
+        except (ValueError, IndexError):
+            pass
+    return False
+
+def _save_resume_sync(text: str):
+    ws = _get_resume_sheet()
+    rows = ws.get_all_values()
+    # Find existing resume row
+    for i, row in enumerate(rows):
+        if row and row[0] == "resume":
+            ws.update_cell(i + 1, 2, text)
+            return
+    ws.append_row(["resume", text])
+
+def _load_resume_sync() -> str | None:
+    ws = _get_resume_sheet()
+    rows = ws.get_all_values()
+    for row in rows:
+        if row and row[0] == "resume":
+            return row[1] if len(row) > 1 else None
+    return None
+
+# ── Async wrappers ────────────────────────────────────────────────────────────
+async def save_job(company, role, location, salary, skills,
+                   apply_link, strong, missing, verdict, summary) -> int:
+    return await asyncio.to_thread(
+        _save_job_sync, company, role, location, salary, skills,
+        apply_link, strong, missing, verdict, summary
+    )
+
+async def all_jobs() -> list[dict]:
+    return await asyncio.to_thread(_all_jobs_sync)
+
+async def job_by_id(jid: int) -> dict | None:
+    return await asyncio.to_thread(_job_by_id_sync, jid)
+
+async def delete_job(jid: int):
+    return await asyncio.to_thread(_delete_job_sync, jid)
+
+async def save_resume(text: str):
+    await asyncio.to_thread(_save_resume_sync, text)
+
+async def load_resume() -> str | None:
+    return await asyncio.to_thread(_load_resume_sync)
 
 # ── Markdown escaping ─────────────────────────────────────────────────────────
-# FIX #5: escape LLM output before injecting into Markdown templates
 _MD_SPECIAL = re.compile(r'([*_`\[\]()~>#+=|{}.!\\-])')
 
 def esc(text: str) -> str:
-    """Escape special chars for Telegram MarkdownV2."""
     return _MD_SPECIAL.sub(r'\\\1', str(text)) if text else ""
 
-# ── Database ──────────────────────────────────────────────────────────────────
-# FIX #7: check_same_thread=False so to_thread() workers can also open connections
-def _con():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
-
-def init_db():
-    con = _con()
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS jobs (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            company     TEXT,
-            role        TEXT,
-            location    TEXT,
-            salary      TEXT,
-            skills      TEXT,
-            raw_jd      TEXT,
-            match_notes TEXT,
-            created_at  TEXT
-        )
-    """)
-    con.commit(); con.close()
-
-# FIX #3: return rowid from the SAME connection that did the insert
-def save_job(company, role, location, salary, skills, raw_jd, match_notes) -> int:
-    con = _con()
-    cur = con.execute(
-        "INSERT INTO jobs (company,role,location,salary,skills,raw_jd,match_notes,created_at) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        (company, role, location, salary, json.dumps(skills),
-         raw_jd, match_notes, datetime.utcnow().isoformat())
-    )
-    jid = cur.lastrowid
-    con.commit(); con.close()
-    return jid
-
-def all_jobs():
-    con = _con()
-    rows = con.execute(
-        "SELECT id,company,role,location,salary,skills,created_at FROM jobs ORDER BY id DESC"
-    ).fetchall()
-    con.close(); return rows
-
-# FIX #10: use row_factory so columns are addressable by name
-def job_by_id(jid: int):
-    con = _con()
-    con.row_factory = sqlite3.Row
-    row = con.execute("SELECT * FROM jobs WHERE id=?", (jid,)).fetchone()
-    con.close()
-    return dict(row) if row else None
-
-def delete_job(jid: int):
-    con = _con()
-    con.execute("DELETE FROM jobs WHERE id=?", (jid,))
-    con.commit(); con.close()
-
-# ── Resume ────────────────────────────────────────────────────────────────────
-def load_resume() -> str | None:
-    if os.path.exists("resume.txt"):
-        with open("resume.txt", encoding="utf-8") as f:
-            return f.read()
-    return None
-
-def save_resume(text: str):
-    with open("resume.txt", "w", encoding="utf-8") as f:
-        f.write(text)
-
 # ── Gemini helpers ────────────────────────────────────────────────────────────
-# FIX #9: exponential backoff retry on rate-limit / transient errors
 def _ask_sync(system: str, user: str, retries: int = 3) -> str:
     delay = 2
     last_err = None
     for attempt in range(retries):
         try:
-            resp = client.models.generate_content(
+            resp = gemini_client.models.generate_content(
                 model=MODEL,
                 contents=user,
                 config=types.GenerateContentConfig(
@@ -116,16 +201,12 @@ def _ask_sync(system: str, user: str, retries: int = 3) -> str:
         except Exception as e:
             last_err = e
             err_str = str(e).lower()
-            # Only retry on rate-limit or server errors
             if "429" in err_str or "quota" in err_str or "503" in err_str or "500" in err_str:
                 if attempt < retries - 1:
-                    time.sleep(delay)
-                    delay *= 2
-                    continue
-            raise  # non-retryable — surface immediately
+                    time.sleep(delay); delay *= 2; continue
+            raise
     raise last_err
 
-# FIX #2: run blocking Gemini call in a thread so the bot event loop stays free
 async def _ask(system: str, user: str) -> str:
     return await asyncio.to_thread(_ask_sync, system, user)
 
@@ -156,7 +237,7 @@ Schema:
   "verdict": "one honest sentence about overall fit"
 }"""
 
-async def match_resume(resume_text: str, skills: list) -> dict:
+async def match_resume_ai(resume_text: str, skills: list) -> dict:
     prompt = f"Resume:\n{resume_text}\n\nRequired skills: {', '.join(skills)}"
     raw = await _ask(MATCH_SYS, prompt)
     raw = raw.replace("```json", "").replace("```", "").strip()
@@ -177,13 +258,12 @@ async def generate_prep(jd_text: str, role: str) -> dict:
     raw = raw.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
-# ── State: pending flows ──────────────────────────────────────────────────────
-# FIX #4 + #6: unified pending state for both /add and /resume flows
-pending: dict[int, str] = {}  # chat_id -> "add" | "resume"
+# ── Multi-step flow state ─────────────────────────────────────────────────────
+# pending[chat_id] = {"step": "jd"|"link"|"resume", "jd_text": str}
+pending: dict[int, dict] = {}
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # FIX #4: clear any stuck pending state on /start
     pending.pop(update.effective_chat.id, None)
     await update.message.reply_text(
         "👋 *Career Bot*\n\n"
@@ -198,60 +278,87 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # FIX #6: if no inline args, wait for NEXT message as resume text
     if not ctx.args:
-        resume = load_resume()
+        resume = await load_resume()
         if resume:
             preview = esc(resume[:500] + ("…" if len(resume) > 500 else ""))
             await update.message.reply_text(
                 f"📄 *Current resume \\(preview\\):*\n\n{preview}\n\n"
-                "Send `/resume` then paste new text to update\\.",
+                "Send `/resume` again then paste new text to update\\.",
                 parse_mode="MarkdownV2"
             )
         else:
-            pending[update.effective_chat.id] = "resume"
+            pending[update.effective_chat.id] = {"step": "resume"}
             await update.message.reply_text(
                 "📝 Paste your full resume text now \\(as a plain message\\):",
                 parse_mode="MarkdownV2"
             )
         return
-
-    # Inline: /resume <text> still works for short resumes
-    save_resume(" ".join(ctx.args))
+    await save_resume(" ".join(ctx.args))
     await update.message.reply_text("✅ Resume saved\\!", parse_mode="MarkdownV2")
 
 async def cmd_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    pending[update.effective_chat.id] = "add"
+    pending[update.effective_chat.id] = {"step": "jd"}
     await update.message.reply_text("📋 Paste the job description now:")
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = (update.message.text or "").strip()
+    state = pending.get(chat_id, {})
+    step = state.get("step")
 
-    state = pending.pop(chat_id, None)
-
-    if state == "resume":
+    # ── resume flow ───────────────────────────────────────────────────────────
+    if step == "resume":
+        pending.pop(chat_id, None)
         if len(text) < 20:
-            await update.message.reply_text("That looks too short for a resume. Try again with `/resume`.", parse_mode="Markdown")
+            await update.message.reply_text(
+                "That looks too short\\. Try `/resume` again\\.",
+                parse_mode="MarkdownV2"
+            )
             return
-        save_resume(text)
-        await update.message.reply_text("✅ Resume saved!")
+        msg = await update.message.reply_text("⏳ Saving resume…")
+        await save_resume(text)
+        await msg.edit_text("✅ Resume saved to Google Sheets\\!", parse_mode="MarkdownV2")
         return
 
-    if state == "add" or len(text) > 200:
-        await process_jd(update, text)
+    # ── jd flow: step 1 — received JD text ───────────────────────────────────
+    if step == "jd":
+        pending[chat_id] = {"step": "link", "jd_text": text}
+        await update.message.reply_text(
+            "🔗 Now paste the *apply link* for this job\\.\n"
+            "Or send `skip` to save without a link\\.",
+            parse_mode="MarkdownV2"
+        )
         return
 
-    await update.message.reply_text("Use /add to paste a JD, or /help for commands.")
+    # ── jd flow: step 2 — received apply link ────────────────────────────────
+    if step == "link":
+        jd_text = state.get("jd_text", "")
+        pending.pop(chat_id, None)
+        apply_link = "" if text.lower() == "skip" else text
+        await process_jd(update, jd_text, apply_link)
+        return
 
-async def process_jd(update: Update, jd_text: str):
+    # ── fallback: long message treated as JD ─────────────────────────────────
+    if len(text) > 200:
+        pending[chat_id] = {"step": "link", "jd_text": text}
+        await update.message.reply_text(
+            "🔗 Got it\\. Now paste the *apply link* for this job\\.\n"
+            "Or send `skip` to save without a link\\.",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    await update.message.reply_text("Use /add to paste a JD, or /help for commands\\.", parse_mode="MarkdownV2")
+
+async def process_jd(update: Update, jd_text: str, apply_link: str):
     msg = await update.message.reply_text("⏳ Analysing job description…")
 
-    # Step 1: extract
+    # Extract
     try:
         parsed = await extract_jd(jd_text)
     except json.JSONDecodeError as e:
-        await msg.edit_text(f"❌ Gemini returned malformed JSON: {esc(str(e))}\nTry again\\.", parse_mode="MarkdownV2")
+        await msg.edit_text(f"❌ Gemini returned bad JSON: {esc(str(e))}", parse_mode="MarkdownV2")
         return
     except Exception as e:
         await msg.edit_text(f"❌ AI call failed: {esc(str(e))}", parse_mode="MarkdownV2")
@@ -264,52 +371,71 @@ async def process_jd(update: Update, jd_text: str):
     skills   = parsed.get("skills") or []
     summary  = (parsed.get("summary") or "").strip()
 
-    # Validate skills is actually a list of strings
     if not isinstance(skills, list):
         skills = []
     skills = [str(s).strip() for s in skills if s]
 
-    # Step 2: resume match (non-fatal if it fails)
-    match_notes = ""
-    resume = load_resume()
+    # Resume match
+    strong, missing, verdict = [], [], ""
+    resume = await load_resume()
     if resume and skills:
         try:
-            m = await match_resume(resume, skills)
-            strong  = ", ".join(m.get("strong", [])) or "—"
-            missing = ", ".join(m.get("missing", [])) or "—"
+            m = await match_resume_ai(resume, skills)
+            strong  = m.get("strong", [])
+            missing = m.get("missing", [])
             verdict = m.get("verdict", "")
-            match_notes = f"Strong: {strong}\nMissing: {missing}\nVerdict: {verdict}"
         except Exception as e:
-            match_notes = f"Match analysis failed: {e}"
+            verdict = f"Match failed: {e}"
 
-    # Step 3: save
-    jid = save_job(company, role, location, salary, skills, jd_text, match_notes)
+    # Save to sheet
+    await msg.edit_text("⏳ Saving to Google Sheets…")
+    try:
+        jid = await save_job(
+            company, role, location, salary, skills,
+            apply_link, strong, missing, verdict, summary
+        )
+    except Exception as e:
+        await msg.edit_text(f"❌ Sheet write failed: {esc(str(e))}", parse_mode="MarkdownV2")
+        return
 
-    # Step 4: reply — FIX #5: escape all LLM output
-    skills_str = esc(", ".join(skills)) if skills else "\\—"
+    # Reply
+    skills_str  = esc(", ".join(skills)) if skills else "—"
+    strong_str  = esc(", ".join(strong)) if strong else "—"
+    missing_str = esc(", ".join(missing)) if missing else "—"
+    link_str    = f"[Apply here]({apply_link})" if apply_link else "—"
+
     reply = (
         f"✅ *Saved as Job \\#{jid}*\n\n"
         f"🏢 {esc(company)} — {esc(role)}\n"
-        f"📍 {esc(location)}  💰 {esc(salary)}\n\n"
+        f"📍 {esc(location)}  💰 {esc(salary)}\n"
+        f"🔗 {link_str}\n\n"
         f"📝 {esc(summary)}\n\n"
-        f"🛠 *Skills:* {skills_str}\n"
+        f"🛠 *Skills:* {skills_str}\n\n"
+        f"📊 *Resume Match:*\n"
+        f"  ✅ Strong: {strong_str}\n"
+        f"  ❌ Missing: {missing_str}\n"
+        f"  💬 {esc(verdict)}\n\n"
+        f"Run `/prep {jid}` for interview prep\\."
     )
-    if match_notes:
-        reply += f"\n📊 *Resume Match:*\n{esc(match_notes)}\n"
-    reply += f"\nRun `/prep {jid}` for interview prep\\."
-
     await msg.edit_text(reply, parse_mode="MarkdownV2")
 
 async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    jobs = all_jobs()
+    msg = await update.message.reply_text("⏳ Loading jobs…")
+    jobs = await all_jobs()
     if not jobs:
-        await update.message.reply_text("No jobs saved yet\\. Use /add\\.", parse_mode="MarkdownV2")
+        await msg.edit_text("No jobs saved yet\\. Use /add\\.", parse_mode="MarkdownV2")
         return
     lines = ["📋 *Saved Jobs*\n"]
     for row in jobs:
-        jid, company, role, location, salary, _, created_at = row
-        lines.append(f"*\\#{jid}* {esc(company)} \\| {esc(role)} \\| {esc(location)} \\| {esc(created_at[:10])}")
-    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+        jid      = row.get("ID", "?")
+        company  = esc(row.get("Company", "?"))
+        role     = esc(row.get("Role", "?"))
+        location = esc(row.get("Location", "—"))
+        date     = esc(str(row.get("Date Added", "")))
+        link     = row.get("Apply Link", "")
+        link_part = f" — [Apply]({link})" if link else ""
+        lines.append(f"*\\#{jid}* {company} \\| {role} \\| {location} \\| {date}{link_part}")
+    await msg.edit_text("\n".join(lines), parse_mode="MarkdownV2")
 
 async def cmd_prep(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
@@ -321,21 +447,28 @@ async def cmd_prep(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Provide a numeric job ID\\.", parse_mode="MarkdownV2")
         return
 
-    row = job_by_id(jid)
+    msg = await update.message.reply_text("⏳ Loading job…")
+    row = await job_by_id(jid)
     if not row:
-        await update.message.reply_text(f"No job \\#{jid} found\\.", parse_mode="MarkdownV2")
+        await msg.edit_text(f"No job \\#{jid} found\\.", parse_mode="MarkdownV2")
         return
 
-    company = row["company"]
-    role    = row["role"]
-    raw_jd  = row["raw_jd"]
+    company = row.get("Company", "")
+    role    = row.get("Role", "")
+    # Reconstruct a JD-like text from what we have stored
+    raw_jd = (
+        f"Company: {company}\nRole: {role}\n"
+        f"Location: {row.get('Location','')}\n"
+        f"Skills required: {row.get('Skills','')}\n"
+        f"Summary: {row.get('Summary','')}"
+    )
 
-    msg = await update.message.reply_text(f"⏳ Generating prep for {esc(role)} @ {esc(company)}…", parse_mode="MarkdownV2")
+    await msg.edit_text(f"⏳ Generating prep for {esc(role)} @ {esc(company)}…", parse_mode="MarkdownV2")
 
     try:
         prep = await generate_prep(raw_jd, role)
     except json.JSONDecodeError:
-        await msg.edit_text("❌ AI returned malformed JSON\\. Try again\\.", parse_mode="MarkdownV2")
+        await msg.edit_text("❌ AI returned bad JSON\\. Try again\\.", parse_mode="MarkdownV2")
         return
     except Exception as e:
         await msg.edit_text(f"❌ Failed: {esc(str(e))}", parse_mode="MarkdownV2")
@@ -354,21 +487,20 @@ async def cmd_prep(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(reply, parse_mode="MarkdownV2")
 
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    jobs = all_jobs()
+    msg = await update.message.reply_text("⏳ Crunching stats…")
+    jobs = await all_jobs()
     if not jobs:
-        await update.message.reply_text("No jobs saved yet\\.", parse_mode="MarkdownV2")
+        await msg.edit_text("No jobs saved yet\\.", parse_mode="MarkdownV2")
         return
 
     all_skills = []
     for row in jobs:
-        _, _, _, _, _, skills_json, _ = row
-        try:
-            all_skills.extend(json.loads(skills_json))
-        except (json.JSONDecodeError, TypeError):  # FIX #8: specific exception
-            pass
+        raw = row.get("Skills", "")
+        if raw:
+            all_skills.extend([s.strip() for s in raw.split(",") if s.strip()])
 
     if not all_skills:
-        await update.message.reply_text("No skills extracted yet\\.", parse_mode="MarkdownV2")
+        await msg.edit_text("No skills extracted yet\\.", parse_mode="MarkdownV2")
         return
 
     counts = Counter(all_skills).most_common(15)
@@ -377,15 +509,15 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         bar = "█" * min(count, 10)
         lines.append(f"`{skill:<22}` {bar} {esc(str(count))}")
 
-    resume = load_resume()
+    resume = await load_resume()
     if resume:
         resume_lower = resume.lower()
         missing = [s for s, _ in counts if s.lower() not in resume_lower]
         if missing:
-            lines.append(f"\n🔴 *You're missing \\(most requested\\):*")
+            lines.append("\n🔴 *You're missing \\(most requested\\):*")
             lines.append(esc(", ".join(missing[:8])))
 
-    await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
+    await msg.edit_text("\n".join(lines), parse_mode="MarkdownV2")
 
 async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
@@ -396,12 +528,15 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Provide a numeric ID\\.", parse_mode="MarkdownV2")
         return
-    delete_job(jid)
-    await update.message.reply_text(f"🗑 Job \\#{jid} deleted\\.", parse_mode="MarkdownV2")
+    msg = await update.message.reply_text("⏳ Deleting…")
+    found = await delete_job(jid)
+    if found:
+        await msg.edit_text(f"🗑 Job \\#{jid} deleted\\.", parse_mode="MarkdownV2")
+    else:
+        await msg.edit_text(f"Job \\#{jid} not found\\.", parse_mode="MarkdownV2")
 
-# ── FIX #1: main() is NOT async — run_polling() is sync and manages its own loop
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    init_db()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("help",   cmd_start))
@@ -413,7 +548,7 @@ def main():
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Bot running…")
-    app.run_polling()   # sync — manages its own event loop correctly
+    app.run_polling()
 
 if __name__ == "__main__":
     main()
