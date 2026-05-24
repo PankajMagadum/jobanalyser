@@ -16,7 +16,18 @@ from telegram.ext import (
 from google import genai
 from google.genai import types
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Config ──────────────────────────────────────────────────────────────────
+print("=== ENV VARS AVAILABLE ===")
+for k in sorted(os.environ.keys()):
+    print(f"  {k}")
+print("==========================")
+
+_REQUIRED = ["TELEGRAM_BOT_TOKEN", "GEMINI_API_KEY", "GOOGLE_SHEET_ID", "GOOGLE_SERVICE_JSON"]
+_missing = [k for k in _REQUIRED if not os.environ.get(k)]
+if _missing:
+    print(f"FATAL: missing env vars: {_missing}")
+    raise SystemExit(1)
+
 TELEGRAM_TOKEN  = os.environ["TELEGRAM_BOT_TOKEN"]
 GEMINI_KEY      = os.environ["GEMINI_API_KEY"]
 SHEET_ID        = os.environ["GOOGLE_SHEET_ID"]        # the spreadsheet ID from the URL
