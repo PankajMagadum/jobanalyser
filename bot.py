@@ -55,13 +55,13 @@ def _jobs_sheet() -> gspread.Worksheet:
     sh = _gc().open_by_key(SHEET_ID)
     try:
         ws = sh.worksheet("Jobs")
-        # Verify header matches — if not, this is a stale sheet from an old version
+        # Add any missing columns to the right — never rename or recreate
         existing = ws.row_values(1)
-        if existing != HEADERS:
-            # Rename old sheet, create fresh one
-            ws.update_title("Jobs_old")
-            ws = sh.add_worksheet(title="Jobs", rows=2000, cols=len(HEADERS))
-            ws.append_row(HEADERS, value_input_option="RAW")
+        for col_name in HEADERS:
+            if col_name not in existing:
+                ws.add_cols(1)
+                ws.update_cell(1, len(existing) + 1, col_name)
+                existing.append(col_name)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title="Jobs", rows=2000, cols=len(HEADERS))
         ws.append_row(HEADERS, value_input_option="RAW")
@@ -537,7 +537,7 @@ def main():
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Bot running…")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
