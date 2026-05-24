@@ -202,7 +202,7 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         resume = load_resume()
         if resume:
-            preview = esc(resume[:500]) + ("…" if len(resume) > 500 else "")
+            preview = esc(resume[:500] + ("…" if len(resume) > 500 else ""))
             await update.message.reply_text(
                 f"📄 *Current resume \\(preview\\):*\n\n{preview}\n\n"
                 "Send `/resume` then paste new text to update\\.",
@@ -251,10 +251,10 @@ async def process_jd(update: Update, jd_text: str):
     try:
         parsed = await extract_jd(jd_text)
     except json.JSONDecodeError as e:
-        await msg.edit_text(f"❌ Gemini returned malformed JSON: {e}\nTry again.")
+        await msg.edit_text(f"❌ Gemini returned malformed JSON: {esc(str(e))}\nTry again\\.", parse_mode="MarkdownV2")
         return
     except Exception as e:
-        await msg.edit_text(f"❌ AI call failed: {e}")
+        await msg.edit_text(f"❌ AI call failed: {esc(str(e))}", parse_mode="MarkdownV2")
         return
 
     company  = (parsed.get("company") or "Unknown").strip()
@@ -286,7 +286,7 @@ async def process_jd(update: Update, jd_text: str):
     jid = save_job(company, role, location, salary, skills, jd_text, match_notes)
 
     # Step 4: reply — FIX #5: escape all LLM output
-    skills_str = esc(", ".join(skills)) if skills else "—"
+    skills_str = esc(", ".join(skills)) if skills else "\\—"
     reply = (
         f"✅ *Saved as Job \\#{jid}*\n\n"
         f"🏢 {esc(company)} — {esc(role)}\n"
@@ -308,7 +308,7 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = ["📋 *Saved Jobs*\n"]
     for row in jobs:
         jid, company, role, location, salary, _, created_at = row
-        lines.append(f"*\\#{jid}* {esc(company)} \\| {esc(role)} \\| {esc(location)} \\| {created_at[:10]}")
+        lines.append(f"*\\#{jid}* {esc(company)} \\| {esc(role)} \\| {esc(location)} \\| {esc(created_at[:10])}")
     await update.message.reply_text("\n".join(lines), parse_mode="MarkdownV2")
 
 async def cmd_prep(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -330,7 +330,7 @@ async def cmd_prep(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     role    = row["role"]
     raw_jd  = row["raw_jd"]
 
-    msg = await update.message.reply_text(f"⏳ Generating prep for {role} @ {company}…")
+    msg = await update.message.reply_text(f"⏳ Generating prep for {esc(role)} @ {esc(company)}…", parse_mode="MarkdownV2")
 
     try:
         prep = await generate_prep(raw_jd, role)
@@ -375,7 +375,7 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = [f"📊 *Skill Frequency \\({len(jobs)} jobs saved\\)*\n"]
     for skill, count in counts:
         bar = "█" * min(count, 10)
-        lines.append(f"`{skill:<22}` {bar} {count}")
+        lines.append(f"`{skill:<22}` {bar} {esc(str(count))}")
 
     resume = load_resume()
     if resume:
